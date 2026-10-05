@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Soccer Rotation Planner</title>
+<!--
+  SOCCER ROTATION PLANNER — assumptions and decisions
+  - Single file, no dependencies, works offline. Roster, settings and the last
+    generated plan are saved in localStorage (all access wrapped in try/catch).
+  - Time Frame: the game clock RESTARTS at 0:00 for the second half (labelled on the sheet).
+  - Minutes inputs are whole minutes. If the half doesn't divide evenly by the
+    rotation length, the last block of each half is shorter.
+  - Goalie stints: added a "Goalie changes" setting (1 per half, 2 per half
+    [default], or every rotation). Each half is split into that many contiguous
+    stints, so the same goalie stays in net for consecutive blocks. Stints go to
+    eligible players with the least goalie time so far; the same kid never gets
+    back-to-back stints unless they're the only eligible goalie.
+  - If minutes can't split evenly (field spots not divisible by players), the
+    gap is one rotation at most, and a message offers the nearest rotation
+    length that splits perfectly, with a one-tap button to switch.
+  - "Max rotations in a row" (default 2): players rest after that many
+    consecutive rotations on the field, goalie time included. Halftime counts as
+    a rest. When the roster is too small for that to be possible (e.g. 10 kids
+    for 7 spots at cap 2), the plan keeps the overruns to a minimum and says so.
+  - Search: several simulated-annealing runs over the full lineup grid.
+    Priority 1 = smallest gap between most- and least-played player.
+    Priority 2 = fewest extra rotations beyond the in-a-row limit.
+    Priority 3 = fewest cases of a player sitting two blocks in a row
+    (halftime counts as consecutive). Shuffle picks a different arrangement with
+    the same minutes gap.
+  - If the target can't be reached, a warning shows the max achievable average
+    and the fairest possible plan is still generated. If the target is below the
+    fair share, players will play more than the target because every field spot
+    must be filled; a note says so.
+  - If fewer players are available than field spots, everyone plays every block.
+  - If nobody is marked "Can play goalie", any available player may be assigned.
+-->
+<style>
+  :root {
+    --board: #eef2f0;
+    --sheet: #ffffff;
+    --ink: #172338;
+    --ink-soft: #4d5a6e;
+    --pitch: #1f6e45;
+    --pitch-deep: #154f31;
+    --line: #cfd8d3;
+    --bib: #f5c518;
+    --bib-ink: #3d3100;
+    --warn-bg: #fff4d6;
+    --warn-line: #e0b33a;
+    --info-bg: #e6f1eb;
+    --err-bg: #fde6e4;
+    --err-line: #c9483c;
+    --display: "Bahnschrift", "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+    --body: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--board);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 16px;
+    line-height: 1.45;
+  }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  :focus-visible { outline: 3px solid var(--pitch); outline-offset: 2px; }
+
+  /* Header: the halfway line */
+  .masthead {
+    background: var(--pitch);
+    color: #fff;
+    position: relative;
+    overflow: hidden;
+  }
+  .masthead svg.lines {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    pointer-events: none; opacity: .22;
+  }
+  .masthead .inner {
+    position: relative;
+    max-width: 1080px; margin: 0 auto;
+    padding: 28px 20px 26px;
+  }
+  .masthead h1 {
+    font-family: var(--display);
+    font-weight: 700;
+    font-stretch: condensed;
+    font-size: clamp(2rem, 6vw, 3.1rem);
+    line-height: 1;
+    letter-spacing: -0.01em;
+    margin: 0 0 8px;
+  }
+  .masthead p { margin: 0; max-width: 60ch; color: #dcefe4; }
+
+  main { max-width: 1080px; margin: 0 auto; padding: 20px 16px 48px; }
+
+  .panel {
+    background: var(--sheet);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  .setup-grid { display: grid; gap: 24px; }
+  @media (min-width: 860px) {
+    .setup-grid { grid-template-columns: 1.1fr 1fr; }
+  }
+  h2 {
+    font-family: var(--display);
+    font-stretch: condensed;
+    font-weight: 700;
+    font-size: 1.45rem;
+    margin: 0 0 12px;
+  }
+  label.field-label { display: block; font-weight: 600; margin-bottom: 6px; }
+  .hint { color: var(--ink-soft); font-size: .9rem; }
+
+  textarea, input[type="number"], input[type="text"], select {
+    width: 100%;
+    min-height: 48px;
+    border: 1.5px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    background: #fbfcfb;
+  }
+  textarea { min-height: 170px; resize: vertical; line-height: 1.5; }
+  textarea:focus, input:focus, select:focus { border-color: var(--pitch); background: #fff; }
+
+  /* Player list */
+  .players { margin-top: 14px; display: grid; gap: 6px; }
+  .player-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 4px 4px 12px;
+    border-radius: 10px;
+    background: var(--board);
+  }
+  .player-row.out .pname { color: var(--ink-soft); text-decoration: line-through; }
+  .pname { font-weight: 600; overflow-wrap: anywhere; }
+  .chip { position: relative; display: inline-flex; }
+  .chip input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .chip span {
+    display: inline-flex; align-items: center; gap: 6px;
+    min-height: 44px; padding: 0 12px;
+    border-radius: 999px;
+    border: 1.5px solid var(--line);
+    background: #fff;
+    font-size: .9rem; font-weight: 600;
+    color: var(--ink-soft);
+    cursor: pointer; user-select: none;
+    white-space: nowrap;
+  }
+  .chip span::before {
+    content: ""; width: 14px; height: 14px; border-radius: 4px;
+    border: 2px solid currentColor; display: inline-block;
+  }
+  .chip input:checked + span { color: var(--pitch-deep); border-color: var(--pitch); background: var(--info-bg); }
+  .chip input:checked + span::before { background: var(--pitch); border-color: var(--pitch); box-shadow: inset 0 0 0 2px #fff; }
+  .chip.gk input:checked + span { color: var(--bib-ink); border-color: #d8a900; background: #fff6cc; }
+  .chip.gk input:checked + span::before { background: var(--bib); border-color: #d8a900; }
+  .chip input:focus-visible + span { outline: 3px solid var(--pitch); outline-offset: 2px; }
+  .chip input:disabled + span { opacity: .45; cursor: not-allowed; }
+  .roster-count { margin: 10px 0 0; }
+
+  .settings { display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
+  .settings .wide { grid-column: 1 / -1; }
+  .target-wrap { display: flex; gap: 8px; }
+  .target-wrap input { flex: 1; }
+  .linkish {
+    background: none; border: none; padding: 0 4px;
+    color: var(--pitch); font-weight: 600; text-decoration: underline;
+    cursor: pointer; min-height: 44px;
+  }
+
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+  .btn {
+    min-height: 52px; padding: 0 22px;
+    border-radius: 12px; border: 2px solid var(--pitch);
+    background: #fff; color: var(--pitch-deep);
+    font-family: var(--display); font-stretch: condensed;
+    font-size: 1.15rem; font-weight: 700;
+    cursor: pointer;
+  }
+  .btn.primary { background: var(--pitch); color: #fff; }
+  .btn.primary:hover { background: var(--pitch-deep); }
+  .btn:hover { background: var(--info-bg); }
+  .btn.primary:hover { color: #fff; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn.grow { flex: 1 1 200px; }
+
+  .foot-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .clear-link { color: var(--err-line); font-weight: 600; padding: 10px 0; }
+  .stale { color: var(--ink-soft); font-size: .92rem; }
+
+  .messages { display: grid; gap: 8px; margin-top: 16px; }
+  .msg { border-radius: 10px; padding: 12px 14px; border-left: 5px solid; }
+  .msg.warn { background: var(--warn-bg); border-color: var(--warn-line); }
+  .msg.info { background: var(--info-bg); border-color: var(--pitch); }
+  .msg.err { background: var(--err-bg); border-color: var(--err-line); }
+  .msg-action { padding: 0; margin-top: 4px; }
+
+  /* Output sheet */
+  .sheet-head { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 6px 20px; margin-bottom: 8px; }
+  .sheet-head h2 { margin: 0; font-size: 1.8rem; }
+  .sheet-label { font-weight: 700; font-size: 1.1rem; }
+  .sheet-meta { color: var(--ink-soft); margin: 0 0 16px; }
+  .half { margin-top: 18px; }
+  .half h3, .summary h3 {
+    font-family: var(--display); font-stretch: condensed;
+    font-size: 1.3rem; margin: 0 0 8px;
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  }
+  .half h3 small { font-family: var(--body); font-size: .85rem; font-weight: 500; color: var(--ink-soft); }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; min-width: 560px; }
+  th, td { border: 1px solid var(--line); padding: 9px 10px; text-align: left; vertical-align: top; }
+  thead th {
+    background: var(--pitch); color: #fff; border-color: var(--pitch);
+    font-family: var(--display); font-stretch: condensed; font-size: 1.02rem;
+  }
+  tbody tr:nth-child(even) td { background: #f7faf8; }
+  td.time { white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 700; width: 1%; }
+  td.gk-cell { white-space: nowrap; width: 1%; }
+  .names { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+  .nm { white-space: nowrap; }
+  .nm:not(:last-child)::after { content: ","; }
+  .bib {
+    display: inline-block;
+    background: var(--bib); color: var(--bib-ink);
+    border-radius: 6px; padding: 1px 8px;
+    font-weight: 800;
+  }
+  .nm .bib + .tag, .gk-tag { font-weight: 800; }
+  .out-cell { color: var(--ink-soft); }
+  .summary { margin-top: 26px; }
+  .summary td.num, .summary th.num { text-align: right; font-variant-numeric: tabular-nums; width: 1%; white-space: nowrap; }
+  .diff-pos { color: var(--pitch-deep); }
+  .diff-neg { color: var(--err-line); }
+  .print-only { display: none; }
+
+  @media (prefers-reduced-motion: no-preference) {
+    #output.fresh { animation: drop .35s ease-out; }
+    @keyframes drop { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  }
+
+  @media (max-width: 560px) {
+    .settings { grid-template-columns: 1fr; }
+    .player-row { grid-template-columns: 1fr auto; }
+    .player-row .pname { grid-column: 1 / -1; padding-top: 6px; }
+    .panel { padding: 16px; }
+  }
+
+  /* PRINT: black and white, one letter page when possible */
+  @page { size: letter portrait; margin: 0.4in; }
+  @media print {
+    html, body { background: #fff !important; color: #000 !important; }
+    body { font-size: 12pt; line-height: 1.3; }
+    .no-print, .masthead, #setup { display: none !important; }
+    .print-only { display: block; }
+    main { max-width: none; padding: 0; }
+    .panel { border: none; padding: 0; margin: 0; border-radius: 0; }
+    #output { animation: none !important; }
+    .sheet-head h2 { font-size: 18pt; }
+    .sheet-label { font-size: 13pt; }
+    .sheet-meta { color: #000; font-size: 10pt; margin-bottom: 6pt; }
+    .half, .summary { margin-top: 10pt; page-break-inside: avoid; break-inside: avoid; }
+    .half h3, .summary h3 { font-size: 13pt; margin-bottom: 4pt; }
+    .half h3 small { color: #000; font-size: 10pt; }
+    .table-wrap { overflow: visible; }
+    table { min-width: 0; page-break-inside: avoid; break-inside: avoid; }
+    th, td { border: 1.2pt solid #000 !important; padding: 4pt 6pt; color: #000 !important; }
+    thead th { background: #fff !important; color: #000 !important; font-size: 11pt; }
+    tbody tr:nth-child(even) td { background: #fff !important; }
+    td { font-size: 12pt; }
+    .out-cell { color: #000; }
+    .bib { background: #fff !important; color: #000 !important; border: 1.2pt solid #000; padding: 0 3pt; }
+    .diff-pos, .diff-neg { color: #000 !important; }
+    * { -webkit-print-color-adjust: economy; print-color-adjust: economy; box-shadow: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<header class="masthead no-print">
+  <svg class="lines" viewBox="0 0 1000 200" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+    <g fill="none" stroke="#fff" stroke-width="4">
+      <line x1="640" y1="0" x2="640" y2="200"/>
+      <circle cx="640" cy="100" r="78"/>
+      <circle cx="640" cy="100" r="5" fill="#fff"/>
+      <rect x="880" y="30" width="140" height="140"/>
+    </g>
+  </svg>
+  <div class="inner">
+    <h1>Soccer Rotation Planner</h1>
+    <p>Enter your roster and game settings, generate fair substitutions with goalie turns, then print the sheet for the sideline.</p>
+  </div>
+</header>
+
+<main>
+  <section class="panel no-print" id="setup" aria-label="Game setup">
+    <div class="setup-grid">
+      <div>
+        <h2>Roster</h2>
+        <label class="field-label" for="roster">Players, one name per line</label>
+        <textarea id="roster" spellcheck="false" placeholder="Ava&#10;Ben&#10;Carlos&#10;Dani&#10;Eli&#10;Finn&#10;Grace&#10;Hana&#10;Isaac&#10;Jules"></textarea>
+        <div class="players" id="playerList" aria-live="polite"></div>
+        <p class="hint roster-count" id="rosterCount"></p>
+      </div>
+
+      <div>
+        <h2>Game settings</h2>
+        <div class="settings">
+          <div>
+            <label class="field-label" for="onField">Players on field</label>
+            <input type="number" id="onField" min="2" max="15" step="1" inputmode="numeric">
+            <div class="hint">Including the goalie</div>
+          </div>
+          <div>
+            <label class="field-label" for="halfMin">Minutes per half</label>
+            <input type="number" id="halfMin" min="1" max="60" step="1" inputmode="numeric">
+          </div>
+          <div>
+            <label class="field-label" for="rotMin">Rotation length (min)</label>
+            <input type="number" id="rotMin" min="1" max="60" step="1" inputmode="numeric">
+            <div class="hint">How often subs happen</div>
+          </div>
+          <div>
+            <label class="field-label" for="maxRun">Max rotations in a row</label>
+            <select id="maxRun">
+              <option value="1">1, then sit</option>
+              <option value="2">2, then sit</option>
+              <option value="3">3, then sit</option>
+              <option value="0">No limit</option>
+            </select>
+            <div class="hint">On the field before a rest</div>
+          </div>
+          <div class="wide">
+            <label class="field-label" for="goalieChanges">Goalie changes</label>
+            <select id="goalieChanges">
+              <option value="1">One goalie per half</option>
+              <option value="2">Two per half</option>
+              <option value="every">Every rotation</option>
+            </select>
+            <div class="hint">Goalie stints are shortened if needed to stay within the rotations-in-a-row limit.</div>
+          </div>
+          <div class="wide">
+            <label class="field-label" for="target">Target minutes per player</label>
+            <div class="target-wrap">
+              <input type="number" id="target" min="0" max="120" step="1" inputmode="numeric">
+              <button type="button" class="linkish" id="useFair">Use fair share</button>
+            </div>
+            <div class="hint" id="fairHint"></div>
+          </div>
+          <div class="wide">
+            <label class="field-label" for="label">Opponent / date (printed on the sheet)</label>
+            <input type="text" id="label" placeholder="vs. Lightning, Sat Oct 10" autocomplete="off">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="button" class="btn primary grow" id="generateBtn">Generate rotation</button>
+      <button type="button" class="btn" id="shuffleBtn" disabled>Shuffle</button>
+      <button type="button" class="btn" id="printBtn" disabled>Print</button>
+    </div>
+    <div class="messages" id="messages" role="status"></div>
+    <div class="foot-row">
+      <span class="stale" id="staleNote" hidden>Settings changed since this plan was made. Generate again to update it.</span>
+      <a href="#" class="clear-link" id="clearData">Clear saved data</a>
+    </div>
+  </section>
+
+  <section class="panel" id="output" hidden aria-label="Rotation plan">
+    <div class="sheet-head">
+      <h2>Rotation plan</h2>
+      <div class="sheet-label" id="sheetLabel"></div>
+    </div>
+    <p class="sheet-meta" id="sheetMeta"></p>
+
+    <div class="half">
+      <h3>First Half</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th scope="col">Time Frame</th><th scope="col">Players In</th><th scope="col">Goalie</th><th scope="col">Players Out</th></tr></thead>
+          <tbody id="half1"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="half">
+      <h3>Second Half <small>Clock restarts at 0:00</small></h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th scope="col">Time Frame</th><th scope="col">Players In</th><th scope="col">Goalie</th><th scope="col">Players Out</th></tr></thead>
+          <tbody id="half2"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="summary">
+      <h3>Playing time summary</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th scope="col">Player</th><th scope="col" class="num">Total Minutes</th><th scope="col" class="num">Goalie Minutes</th><th scope="col" class="num">Blocks Sat</th><th scope="col" class="num">Most in a Row</th><th scope="col" class="num">vs. Target</th></tr></thead>
+          <tbody id="summaryBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  var STORE_KEY = 'soccerRotationPlanner.v1';
+  var RESTARTS = 8;
+  var ITERS = 12000;
+
+  var DEFAULTS = {
+    rosterText: '',
+    flags: {},
+    onField: 7,
+    halfMin: 25,
+    rotMin: 5,
+    target: null,
+    targetTouched: false,
+    goalieChanges: '2',
+    maxRun: '2',
+    label: '',
+    plan: null
+  };
+
+  var state = clone(DEFAULTS);
+
+  function $(id) { return document.getElementById(id); }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+
+  /* ---------- storage ---------- */
+  function load() {
+    try {
+      var raw = localStorage.getItem(STORE_KEY);
+      if (!raw) return;
+      var saved = JSON.parse(raw);
+      if (saved && typeof saved === 'object') {
+        Object.keys(DEFAULTS).forEach(function (k) {
+          if (Object.prototype.hasOwnProperty.call(saved, k)) state[k] = saved[k];
+        });
+        if (!state.flags || typeof state.flags !== 'object') state.flags = {};
+      }
+    } catch (e) { /* storage unavailable or corrupt; use defaults */ }
+  }
+  function save() {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) { /* ignore */ }
+  }
+  function clearSaved() {
+    try { localStorage.removeItem(STORE_KEY); } catch (e) { /* ignore */ }
+  }
+
+  /* ---------- helpers ---------- */
+  function parseNames(text) {
+    var seen = {};
+    var out = [];
+    String(text || '').split(/\r?\n/).forEach(function (line) {
+      var n = line.replace(/\s+/g, ' ').trim();
+      if (!n) return;
+      var key = n.toLowerCase();
+      if (seen[key]) return;
+      seen[key] = true;
+      out.push(n);
+    });
+    return out;
+  }
+  function flagFor(name) {
+    if (!state.flags[name]) state.flags[name] = { avail: true, gk: true };
+    return state.flags[name];
+  }
+  function intFrom(id, min, max, fallback) {
+    var v = parseInt($(id).value, 10);
+    if (isNaN(v)) return fallback;
+    return Math.max(min, Math.min(max, v));
+  }
+  function fmtClock(min) {
+    var whole = Math.floor(min);
+    var secs = Math.round((min - whole) * 60);
+    return whole + ':' + (secs < 10 ? '0' : '') + secs;
+  }
+  function round1(x) { return Math.round(x * 10) / 10; }
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function readSettings() {
+    var halfMin = intFrom('halfMin', 1, 60, 25);
+    var rotMin = intFrom('rotMin', 1, 60, 5);
+    if (rotMin > halfMin) rotMin = halfMin;
+    return {
+      onField: intFrom('onField', 2, 15, 7),
+      halfMin: halfMin,
+      rotMin: rotMin,
+      goalieChanges: $('goalieChanges').value,
+      maxRun: parseInt($('maxRun').value, 10) || 0,
+      target: intFrom('target', 0, 120, 0),
+      label: $('label').value.trim()
+    };
+  }
+
+  function availablePlayers() {
+    return parseNames(state.rosterText).filter(function (n) { return flagFor(n).avail; });
+  }
+
+  function fairShare(onField, halfMin, n) {
+    if (!n) return 0;
+    var effF = Math.min(onField, n);
+    return Math.floor(effF * halfMin * 2 / n);
+  }
+
+  /* ---------- form rendering ---------- */
+  function renderPlayerList() {
+    var names = parseNames(state.rosterText);
+    var list = $('playerList');
+    list.innerHTML = '';
+    names.forEach(function (name) {
+      var f = flagFor(name);
+      var row = document.createElement('div');
+      row.className = 'player-row' + (f.avail ? '' : ' out');
+
+      var nm = document.createElement('span');
+      nm.className = 'pname';
+      nm.textContent = name;
+
+      var a = makeChip('Available today', f.avail, '', function (checked) {
+        f.avail = checked;
+        row.classList.toggle('out', !checked);
+        g.querySelector('input').disabled = !checked;
+        afterFormChange();
+      });
+      var g = makeChip('Can play goalie', f.gk, 'gk', function (checked) {
+        f.gk = checked;
+        afterFormChange();
+      });
+      g.querySelector('input').disabled = !f.avail;
+
+      row.appendChild(nm);
+      row.appendChild(a);
+      row.appendChild(g);
+      list.appendChild(row);
+    });
+
+    var avail = availablePlayers();
+    var gkCount = avail.filter(function (n) { return flagFor(n).gk; }).length;
+    $('rosterCount').textContent = names.length
+      ? avail.length + ' of ' + names.length + ' available today, ' + gkCount + ' can play goalie.'
+      : 'Add at least one player to get started.';
+  }
+
+  function makeChip(text, checked, extraClass, onChange) {
+    var label = document.createElement('label');
+    label.className = 'chip' + (extraClass ? ' ' + extraClass : '');
+    var input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = !!checked;
+    input.addEventListener('change', function () { onChange(input.checked); });
+    var span = document.createElement('span');
+    span.textContent = text;
+    label.appendChild(input);
+    label.appendChild(span);
+    return label;
+  }
+
+  function updateFairHint() {
+    var s = readSettings();
+    var n = availablePlayers().length;
+    var fair = fairShare(s.onField, s.halfMin, n);
+    $('fairHint').textContent = n
+      ? 'Fair share with ' + n + ' available players: ' + fair + ' min each.'
+      : 'Fair share appears once players are added.';
+    if (!state.targetTouched || state.target === null) {
+      $('target').value = fair;
+      state.target = fair;
+    }
+  }
+
+  function writeFormFromState() {
+    $('roster').value = state.rosterText || '';
+    $('onField').value = state.onField;
+    $('halfMin').value = state.halfMin;
+    $('rotMin').value = state.rotMin;
+    $('goalieChanges').value = state.goalieChanges || '2';
+    $('maxRun').value = String(state.maxRun === undefined || state.maxRun === null ? '2' : state.maxRun);
+    $('label').value = state.label || '';
+    if (state.target !== null && state.target !== undefined) $('target').value = state.target;
+    renderPlayerList();
+    updateFairHint();
+  }
+
+  function syncStateFromForm() {
+    var s = readSettings();
+    state.rosterText = $('roster').value;
+    state.onField = s.onField;
+    state.halfMin = s.halfMin;
+    state.rotMin = s.rotMin;
+    state.goalieChanges = s.goalieChanges;
+    state.maxRun = String(s.maxRun);
+    state.label = s.label;
+    var tv = parseInt($('target').value, 10);
+    state.target = isNaN(tv) ? null : tv;
+  }
+
+  function afterFormChange() {
+    syncStateFromForm();
+    renderPlayerList();
+    updateFairHint();
+    if (state.plan) $('staleNote').hidden = false;
+    save();
+  }
+
+  /* ---------- rotation engine ---------- */
+  function buildBlocks(halfMin, rotMin) {
+    var blocks = [];
+    for (var h = 0; h < 2; h++) {
+      var start = 0;
+      while (start < halfMin) {
+        var end = Math.min(start + rotMin, halfMin);
+        blocks.push({ half: h, start: start, end: end, dur: end - start });
+        start = end;
+      }
+    }
+    return blocks;
+  }
+
+  // Split k blocks into c contiguous groups, as even as possible (longer groups first).
+  function stintGroups(k, c) {
+    c = Math.max(1, Math.min(c, k));
+    var base = Math.floor(k / c), extra = k % c;
+    var groups = [], idx = 0;
+    for (var g = 0; g < c; g++) {
+      var size = base + (g < extra ? 1 : 0);
+      var arr = [];
+      for (var i = 0; i < size; i++) arr.push(idx++);
+      groups.push(arr);
+    }
+    return groups;
+  }
+
+  // Goalie stints: contiguous stretches per half, never longer than the in-a-row limit.
+  function planGoalies(gkIdx, blocks, perHalf, changes, cap) {
+    var c = changes === 'every' ? perHalf : parseInt(changes, 10) || 2;
+    if (cap > 0) c = Math.max(c, Math.ceil(perHalf / cap));
+    var groups = stintGroups(perHalf, c);
+    var gb = new Array(blocks.length);
+    var gkMin = {}, tie = {}, prevG = -1;
+    gkIdx.forEach(function (p) { gkMin[p] = 0; tie[p] = Math.random(); });
+    for (var h = 0; h < 2; h++) {
+      groups.forEach(function (grp) {
+        var idxs = grp.map(function (i) { return h * perHalf + i; });
+        var mins = idxs.reduce(function (sum, i) { return sum + blocks[i].dur; }, 0);
+        var cands = gkIdx.slice();
+        if (cands.length > 1 && prevG !== -1) cands = cands.filter(function (p) { return p !== prevG; });
+        cands.sort(function (a, b) { return (gkMin[a] - gkMin[b]) || (tie[a] - tie[b]); });
+        var chosen = cands[0];
+        gkMin[chosen] += mins;
+        idxs.forEach(function (i) { gb[i] = chosen; });
+        prevG = chosen;
+      });
+    }
+    return gb;
+  }
+
+  // Score a lineup grid. on[block][player] = true if on the field.
+  // Priority: fair minutes first, then no long stretches on the field, then no back-to-back sits.
+  function scorePlan(on, blocks, n, cap) {
+    var mins = [], excess = 0, overRuns = 0, consec = 0;
+    for (var p = 0; p < n; p++) {
+      var m = 0, run = 0, satPrev = false;
+      for (var b = 0; b < blocks.length; b++) {
+        if (b > 0 && blocks[b].half !== blocks[b - 1].half) run = 0; // halftime is a rest
+        if (on[b][p]) {
+          m += blocks[b].dur;
+          run++;
+          if (cap > 0 && run > cap) { excess++; if (run === cap + 1) overRuns++; }
+          satPrev = false;
+        } else {
+          if (satPrev) consec++;
+          satPrev = true;
+          run = 0;
+        }
+      }
+      mins.push(m);
+    }
+    var spread = Math.max.apply(null, mins) - Math.min.apply(null, mins);
+    return { spread: spread, excess: excess, overRuns: overRuns, consec: consec,
+             cost: spread * 1000 + excess * 10 + consec };
+  }
+
+  // Simulated annealing over the lineup grid: swap one player in for one player out within a block.
+  function anneal(n, effF, blocks, gb, cap, iters) {
+    var B = blocks.length, on = [];
+    for (var b = 0; b < B; b++) {
+      var row = [], others = [];
+      for (var p = 0; p < n; p++) { row.push(p === gb[b]); if (p !== gb[b]) others.push(p); }
+      shuffleArr(others);
+      for (var k = 0; k < effF - 1; k++) row[others[k]] = true;
+      on.push(row);
+    }
+    var curRes = scorePlan(on, blocks, n, cap), cur = curRes.cost;
+    var best = cur, bestRes = curRes, bestOn = on.map(function (r) { return r.slice(); });
+    var T = 2;
+    for (var i = 0; i < iters && best > 0; i++) {
+      var bi = Math.floor(Math.random() * B), ins = [], outs = [];
+      for (var q = 0; q < n; q++) {
+        if (q === gb[bi]) continue;
+        (on[bi][q] ? ins : outs).push(q);
+      }
+      if (ins.length && outs.length) {
+        var a = ins[Math.floor(Math.random() * ins.length)];
+        var z = outs[Math.floor(Math.random() * outs.length)];
+        on[bi][a] = false; on[bi][z] = true;
+        var res = scorePlan(on, blocks, n, cap);
+        if (res.cost <= cur || Math.random() < Math.exp((cur - res.cost) / T)) {
+          cur = res.cost;
+          if (cur < best) { best = cur; bestRes = res; bestOn = on.map(function (r) { return r.slice(); }); }
+        } else {
+          on[bi][a] = true; on[bi][z] = false;
+        }
+      }
+      T = Math.max(0.01, T * 0.9995);
+    }
+    return { on: bestOn, res: bestRes };
+  }
+
+  function shuffleArr(a) {
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+    return a;
+  }
+
+  function generate(isShuffle) {
+    syncStateFromForm();
+    save();
+    var msgs = [];
+    var s = readSettings();
+    var players = availablePlayers();
+    var n = players.length;
+
+    if (!n) {
+      showMessages([{ type: 'err', text: 'No players are available. Add names to the roster and make sure "Available today" is on for at least one player.' }]);
+      return;
+    }
+
+    var F = s.onField;
+    var effF = Math.min(F, n);
+    var total = s.halfMin * 2;
+    if (n < F) {
+      msgs.push({ type: 'warn', text: 'Only ' + n + ' players are available for ' + F + ' field spots. Everyone plays the whole game, and you\'ll be playing short-handed.' });
+    }
+
+    var eligible = players.filter(function (p) { return flagFor(p).gk; });
+    var gkPool = eligible;
+    if (!eligible.length) {
+      gkPool = players;
+      msgs.push({ type: 'warn', text: 'No available player is marked "Can play goalie," so goalies were picked from the whole roster.' });
+    } else if (eligible.length === 1) {
+      msgs.push({ type: 'info', text: eligible[0] + ' is the only eligible goalie, so they play in net all game.' });
+    }
+
+    var fieldMinutes = effF * total;
+    var maxAvg = fieldMinutes / n;
+    if (s.target > maxAvg + 1e-9) {
+      msgs.push({ type: 'warn', text: 'A ' + s.target + '-minute target isn\'t reachable: with ' + n + ' players and ' + effF + ' on the field for ' + total + ' minutes, the most each player can average is ' + round1(maxAvg) + ' minutes. Here\'s the fairest plan possible.' });
+    } else if (s.target < Math.floor(maxAvg) && n > effF) {
+      msgs.push({ type: 'info', text: 'Every field spot has to be filled, so players will average about ' + round1(maxAvg) + ' minutes, above your ' + s.target + '-minute target.' });
+    }
+
+    var blocks = buildBlocks(s.halfMin, s.rotMin);
+    var perHalf = blocks.length / 2;
+    var gkIdx = gkPool.map(function (p) { return players.indexOf(p); });
+
+    var results = [];
+    for (var t = 0; t < RESTARTS; t++) {
+      var gb = planGoalies(gkIdx, blocks, perHalf, s.goalieChanges, s.maxRun);
+      var r = anneal(n, effF, blocks, gb, s.maxRun, ITERS);
+      var outBlocks = blocks.map(function (b, bi) {
+        var ins = [], outs = [];
+        players.forEach(function (p, pi) { (r.on[bi][pi] ? ins : outs).push(p); });
+        return { half: b.half, start: b.start, end: b.end, goalie: players[gb[bi]], ins: ins, outs: outs };
+      });
+      results.push({
+        blocks: outBlocks,
+        res: r.res,
+        sig: outBlocks.map(function (x) { return x.goalie + '|' + x.ins.join(','); }).join(';')
+      });
+    }
+    results.sort(function (a, b) { return a.res.cost - b.res.cost; });
+
+    var pick = results[0];
+    var prevSig = state.plan && state.plan.sig;
+    if (isShuffle && prevSig) {
+      var alts = results.filter(function (x) { return x.sig !== prevSig && x.res.spread === results[0].res.spread; });
+      if (alts.length) {
+        var bestCost = alts[0].res.cost;
+        var top = alts.filter(function (x) { return x.res.cost === bestCost; });
+        pick = top[Math.floor(Math.random() * top.length)];
+      } else {
+        msgs.push({ type: 'info', text: 'This is the only arrangement with the fairest minutes for these settings.' });
+      }
+    } else {
+      var ties = results.filter(function (x) { return x.res.cost === results[0].res.cost; });
+      pick = ties[Math.floor(Math.random() * ties.length)];
+    }
+
+    if (pick.res.spread > 0 && n > effF) {
+      var slotsNow = effF * blocks.length;
+      var evenRot = evenRotation(s.halfMin, effF, n, s.rotMin);
+      var unevenText = 'Minutes can\'t split evenly: ' + slotsNow + ' field spots across ' + n +
+        ' players means some kids get one fewer rotation than others. This is the closest possible with ' +
+        s.rotMin + '-minute rotations.';
+      if (evenRot) {
+        var each = effF * 2 * s.halfMin / n;
+        msgs.push({ type: 'warn', text: unevenText + ' With ' + evenRot + '-minute rotations, everyone plays exactly ' + each + ' minutes.',
+                    action: { label: 'Switch to ' + evenRot + '-minute rotations', rot: evenRot } });
+      } else {
+        msgs.push({ type: 'info', text: unevenText + ' No rotation length makes it come out perfectly even for this roster size.' });
+      }
+    }
+    if (s.maxRun > 0 && pick.res.overRuns > 0) {
+      var needed = Math.ceil(effF * (s.maxRun + 1) / s.maxRun);
+      msgs.push({ type: 'warn', text: 'With ' + n + ' players for ' + effF + ' spots, kids are on the field too much of the game for everyone to sit after ' + s.maxRun + ' rotations. A player stays on longer ' + pick.res.overRuns + (pick.res.overRuns === 1 ? ' time' : ' times') + ' in this plan (see "Most in a Row" below). About ' + needed + ' available players would avoid it entirely.' });
+    }
+    if (pick.res.consec > 0 && n > effF) {
+      msgs.push({ type: 'info', text: 'Someone sits two rotations in a row ' + pick.res.consec + (pick.res.consec === 1 ? ' time' : ' times') + ' in this plan; with this many players sitting at once it can\'t be avoided without hurting fairness.' });
+    }
+
+    state.plan = {
+      players: players,
+      blocks: pick.blocks,
+      sig: pick.sig,
+      settings: { onField: effF, halfMin: s.halfMin, rotMin: s.rotMin, target: s.target, label: s.label, maxRun: s.maxRun }
+    };
+    state.messages = msgs;
+    save();
+    showMessages(msgs);
+    renderPlan(state.plan, true);
+  }
+
+  /* ---------- output rendering ---------- */
+  function showMessages(msgs) {
+    var box = $('messages');
+    box.innerHTML = '';
+    (msgs || []).forEach(function (m) {
+      var d = document.createElement('div');
+      d.className = 'msg ' + m.type;
+      d.textContent = m.text;
+      if (m.action && m.action.rot) {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'linkish msg-action';
+        btn.textContent = m.action.label;
+        btn.addEventListener('click', function () {
+          $('rotMin').value = m.action.rot;
+          afterFormChange();
+          generate(false);
+        });
+        d.appendChild(document.createElement('br'));
+        d.appendChild(btn);
+      }
+      box.appendChild(d);
+    });
+  }
+
+  // Closest rotation length (3-15 min, divides the half evenly) that gives every player identical minutes.
+  function evenRotation(halfMin, effF, n, current) {
+    var opts = [];
+    for (var r = 3; r <= Math.min(15, halfMin); r++) {
+      if (halfMin % r !== 0) continue;
+      if ((effF * (2 * halfMin / r)) % n === 0) opts.push(r);
+    }
+    opts.sort(function (a, b) { return (Math.abs(a - current) - Math.abs(b - current)) || (b - a); });
+    return opts.length ? opts[0] : null;
+  }
+
+  function namesHTML(list, goalie) {
+    if (!list.length) return '<span class="out-cell">None</span>';
+    return '<span class="names">' + list.map(function (p) {
+      if (p === goalie) return '<span class="nm"><span class="bib">' + esc(p) + ' (GK)</span></span>';
+      return '<span class="nm">' + esc(p) + '</span>';
+    }).join('') + '</span>';
+  }
+
+  function renderPlan(plan, fresh) {
+    if (!plan || !plan.blocks) return;
+    var st = plan.settings;
+    $('sheetLabel').textContent = st.label || '';
+    $('sheetMeta').textContent =
+      st.onField + ' on the field, two ' + st.halfMin + '-minute halves, subs every ' + st.rotMin +
+      ' minutes. Target: ' + st.target + ' minutes per player.' +
+      (st.maxRun > 0 ? ' Players rest after ' + st.maxRun + (st.maxRun === 1 ? ' rotation' : ' rotations') + ' on the field where possible.' : '');
+
+    ['half1', 'half2'].forEach(function (id, h) {
+      var body = $(id);
+      body.innerHTML = plan.blocks.filter(function (b) { return b.half === h; }).map(function (b) {
+        return '<tr>' +
+          '<td class="time">' + fmtClock(b.start) + '\u2013' + fmtClock(b.end) + '</td>' +
+          '<td>' + namesHTML(b.ins, b.goalie) + '</td>' +
+          '<td class="gk-cell"><span class="bib">' + esc(b.goalie) + '</span></td>' +
+          '<td class="out-cell">' + (b.outs.length ? namesHTML(b.outs, null) : 'None') + '</td>' +
+          '</tr>';
+      }).join('');
+    });
+
+    var tot = {}, gk = {}, sat = {}, run = {}, best = {};
+    plan.players.forEach(function (p) { tot[p] = 0; gk[p] = 0; sat[p] = 0; run[p] = 0; best[p] = 0; });
+    plan.blocks.forEach(function (b, i) {
+      if (i > 0 && plan.blocks[i - 1].half !== b.half) plan.players.forEach(function (p) { run[p] = 0; });
+      plan.players.forEach(function (p) {
+        if (b.ins.indexOf(p) !== -1) { run[p]++; if (run[p] > best[p]) best[p] = run[p]; } else { run[p] = 0; }
+      });
+    });
+    var cap = st.maxRun || 0;
+    plan.blocks.forEach(function (b) {
+      var d = b.end - b.start;
+      b.ins.forEach(function (p) { tot[p] += d; });
+      b.outs.forEach(function (p) { sat[p] += 1; });
+      gk[b.goalie] += d;
+    });
+    $('summaryBody').innerHTML = plan.players.map(function (p) {
+      var diff = tot[p] - st.target;
+      var cls = diff > 0 ? 'diff-pos' : (diff < 0 ? 'diff-neg' : '');
+      var txt = diff > 0 ? '+' + diff : (diff < 0 ? '\u2212' + Math.abs(diff) : '0');
+      return '<tr><td>' + esc(p) + '</td>' +
+        '<td class="num">' + tot[p] + '</td>' +
+        '<td class="num">' + gk[p] + '</td>' +
+        '<td class="num">' + sat[p] + '</td>' +
+        '<td class="num' + (cap > 0 && best[p] > cap ? ' diff-neg' : '') + '">' + best[p] + '</td>' +
+        '<td class="num ' + cls + '">' + txt + '</td></tr>';
+    }).join('');
+
+    var out = $('output');
+    out.hidden = false;
+    if (fresh) {
+      out.classList.remove('fresh');
+      void out.offsetWidth;
+      out.classList.add('fresh');
+    }
+    $('shuffleBtn').disabled = false;
+    $('printBtn').disabled = false;
+    $('staleNote').hidden = true;
+  }
+
+  /* ---------- wiring ---------- */
+  function init() {
+    load();
+    writeFormFromState();
+    if (state.plan) {
+      renderPlan(state.plan, false);
+      showMessages(state.messages || []);
+    }
+
+    $('roster').addEventListener('input', afterFormChange);
+    ['onField', 'halfMin', 'rotMin', 'maxRun', 'goalieChanges'].forEach(function (id) {
+      $(id).addEventListener('input', afterFormChange);
+      $(id).addEventListener('change', afterFormChange);
+    });
+    $('label').addEventListener('input', function () {
+      state.label = $('label').value.trim();
+      save();
+      if (state.plan) {
+        state.plan.settings.label = $('label').value.trim();
+        $('sheetLabel').textContent = state.plan.settings.label;
+        save();
+      }
+    });
+    $('target').addEventListener('input', function () {
+      state.targetTouched = true;
+      afterFormChange();
+    });
+    $('useFair').addEventListener('click', function () {
+      state.targetTouched = false;
+      state.target = null;
+      updateFairHint();
+      afterFormChange();
+    });
+    $('generateBtn').addEventListener('click', function () { generate(false); });
+    $('shuffleBtn').addEventListener('click', function () { generate(true); });
+    $('printBtn').addEventListener('click', function () { window.print(); });
+    $('clearData').addEventListener('click', function (e) {
+      e.preventDefault();
+      if (!window.confirm('Clear the saved roster, settings, and plan?')) return;
+      clearSaved();
+      state = clone(DEFAULTS);
+      $('output').hidden = true;
+      $('shuffleBtn').disabled = true;
+      $('printBtn').disabled = true;
+      $('staleNote').hidden = true;
+      showMessages([]);
+      writeFormFromState();
+    });
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
