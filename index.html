@@ -2,8 +2,17 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Soccer Rotation Planner</title>
+<meta name="theme-color" content="#1f6e45">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Rotations">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="icon" href="icon-192.png" sizes="192x192" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <!--
   SOCCER ROTATION PLANNER — assumptions and decisions
   - Single file, no dependencies, works offline. Roster, settings and the last
@@ -35,6 +44,17 @@
     must be filled; a note says so.
   - If fewer players are available than field spots, everyone plays every block.
   - If nobody is marked "Can play goalie", any available player may be assigned.
+  - Hosted on GitHub Pages and installable to a phone's home screen
+    (manifest.webmanifest). sw.js caches the page so it opens with no signal at
+    the field; it serves the cached copy first and refreshes it in the
+    background, so an update shows up on the next open. Bump CACHE in sw.js
+    when adding files.
+  - Saved data lives in each device's browser, so the roster is entered once
+    per phone.
+  - Phone layout (560px and below): roster rows stay on one line with short chip
+    labels, the action bar sticks to the bottom of the screen while scrolling
+    the setup, Generate scrolls down to the plan, and plan rows become cards
+    so nothing scrolls sideways. Print layout is unchanged.
 -->
 <style>
   :root {
@@ -104,6 +124,7 @@
     margin-bottom: 20px;
   }
   .setup-grid { display: grid; gap: 24px; }
+  .setup-grid > div { min-width: 0; }
   @media (min-width: 860px) {
     .setup-grid { grid-template-columns: 1.1fr 1fr; }
   }
@@ -143,7 +164,7 @@
   .pname { font-weight: 600; overflow-wrap: anywhere; }
   .chip { position: relative; display: inline-flex; }
   .chip input { position: absolute; opacity: 0; width: 1px; height: 1px; }
-  .chip span {
+  .chip > span {
     display: inline-flex; align-items: center; gap: 6px;
     min-height: 44px; padding: 0 12px;
     border-radius: 999px;
@@ -154,7 +175,7 @@
     cursor: pointer; user-select: none;
     white-space: nowrap;
   }
-  .chip span::before {
+  .chip > span::before {
     content: ""; width: 14px; height: 14px; border-radius: 4px;
     border: 2px solid currentColor; display: inline-block;
   }
@@ -164,6 +185,7 @@
   .chip.gk input:checked + span::before { background: var(--bib); border-color: #d8a900; }
   .chip input:focus-visible + span { outline: 3px solid var(--pitch); outline-offset: 2px; }
   .chip input:disabled + span { opacity: .45; cursor: not-allowed; }
+  .lbl-short { display: none; }
   .roster-count { margin: 10px 0 0; }
 
   .settings { display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
@@ -241,17 +263,61 @@
   .diff-pos { color: var(--pitch-deep); }
   .diff-neg { color: var(--err-line); }
   .print-only { display: none; }
+  .sheet-tools { margin: -8px 0 8px; }
+  .abbr { display: none; }
 
   @media (prefers-reduced-motion: no-preference) {
     #output.fresh { animation: drop .35s ease-out; }
     @keyframes drop { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
   }
 
+  /* Phones and tablets: keep Generate in reach while scrolling the roster */
+  @media (max-width: 859px) {
+    .actions {
+      position: sticky; bottom: 0; z-index: 2;
+      margin: 20px -20px 0; padding: 12px 20px calc(12px + env(safe-area-inset-bottom));
+      background: rgba(255, 255, 255, .96);
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+  }
+
   @media (max-width: 560px) {
+    main { padding: 12px 12px 40px; }
+    .masthead .inner { padding: 20px 16px 18px; }
     .settings { grid-template-columns: 1fr; }
-    .player-row { grid-template-columns: 1fr auto; }
-    .player-row .pname { grid-column: 1 / -1; padding-top: 6px; }
     .panel { padding: 16px; }
+    .actions { margin: 16px -16px 0; padding-left: 16px; padding-right: 16px; }
+    .actions { flex-wrap: nowrap; gap: 8px; }
+    .actions .btn { min-height: 48px; padding: 0 8px; font-size: 1.05rem; }
+    .actions .btn.grow { flex: 2 1 0; }
+    .actions .btn:not(.grow) { flex: 1 1 0; }
+    .sheet-tools .linkish { text-align: left; padding: 0; }
+
+    /* Roster: one line per player */
+    .player-row { gap: 6px; padding: 4px 4px 4px 10px; }
+    .chip > span { padding: 0 10px; }
+    .lbl-long { display: none; }
+    .lbl-short { display: inline; }
+
+    /* Plan: each time block becomes a card */
+    .half table, .half tbody, .half tr, .half td { display: block; }
+    .half table { min-width: 0; }
+    .half thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+    .half tr { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-bottom: 10px; }
+    .half td, .half td.time, .half td.gk-cell { width: auto; border: none; border-top: 1px solid var(--line); white-space: normal; }
+    .half td[data-label] { display: grid; grid-template-columns: 4.2em 1fr; gap: 8px; }
+    .half td[data-label]::before { content: attr(data-label); font-weight: 700; color: var(--ink-soft); }
+    .half tbody tr:nth-child(even) td { background: none; }
+    .half tbody td.gk-cell { display: none; } /* goalie is already tagged (GK) in the In list */
+    .half tbody tr td.time { background: var(--pitch); color: #fff; border-top: none; font-family: var(--display); font-stretch: condensed; font-size: 1.1rem; }
+
+    /* Summary: short headers so all columns fit */
+    .summary table { min-width: 0; font-size: .88rem; }
+    .summary th, .summary td { padding: 8px 4px; }
+    .summary th:first-child, .summary td:first-child { padding-left: 8px; overflow-wrap: anywhere; }
+    .summary .full { display: none; }
+    .summary .abbr { display: inline; }
   }
 
   /* PRINT: black and white, one letter page when possible */
@@ -364,7 +430,7 @@
     </div>
 
     <div class="actions">
-      <button type="button" class="btn primary grow" id="generateBtn">Generate rotation</button>
+      <button type="button" class="btn primary grow" id="generateBtn"><span class="lbl-long">Generate rotation</span><span class="lbl-short">Generate</span></button>
       <button type="button" class="btn" id="shuffleBtn" disabled>Shuffle</button>
       <button type="button" class="btn" id="printBtn" disabled>Print</button>
     </div>
@@ -381,6 +447,7 @@
       <div class="sheet-label" id="sheetLabel"></div>
     </div>
     <p class="sheet-meta" id="sheetMeta"></p>
+    <p class="sheet-tools no-print"><button type="button" class="linkish" id="editRoster">Someone missing? Change who's here</button></p>
 
     <div class="half">
       <h3>First Half</h3>
@@ -406,7 +473,7 @@
       <h3>Playing time summary</h3>
       <div class="table-wrap">
         <table>
-          <thead><tr><th scope="col">Player</th><th scope="col" class="num">Total Minutes</th><th scope="col" class="num">Goalie Minutes</th><th scope="col" class="num">Blocks Sat</th><th scope="col" class="num">Most in a Row</th><th scope="col" class="num">vs. Target</th></tr></thead>
+          <thead><tr><th scope="col">Player</th><th scope="col" class="num"><span class="full">Total Minutes</span><span class="abbr" title="Total minutes">Min</span></th><th scope="col" class="num"><span class="full">Goalie Minutes</span><span class="abbr" title="Goalie minutes">GK</span></th><th scope="col" class="num"><span class="full">Blocks Sat</span><span class="abbr" title="Blocks sat">Sat</span></th><th scope="col" class="num"><span class="full">Most in a Row</span><span class="abbr" title="Most rotations in a row">Row</span></th><th scope="col" class="num"><span class="full">vs. Target</span><span class="abbr" title="Versus target">+/&minus;</span></th></tr></thead>
           <tbody id="summaryBody"></tbody>
         </table>
       </div>
@@ -536,13 +603,13 @@
       nm.className = 'pname';
       nm.textContent = name;
 
-      var a = makeChip('Available today', f.avail, '', function (checked) {
+      var a = makeChip('Available today', 'Here', name, f.avail, '', function (checked) {
         f.avail = checked;
         row.classList.toggle('out', !checked);
         g.querySelector('input').disabled = !checked;
         afterFormChange();
       });
-      var g = makeChip('Can play goalie', f.gk, 'gk', function (checked) {
+      var g = makeChip('Can play goalie', 'Goalie', name, f.gk, 'gk', function (checked) {
         f.gk = checked;
         afterFormChange();
       });
@@ -561,15 +628,23 @@
       : 'Add at least one player to get started.';
   }
 
-  function makeChip(text, checked, extraClass, onChange) {
+  function makeChip(text, shortText, player, checked, extraClass, onChange) {
     var label = document.createElement('label');
     label.className = 'chip' + (extraClass ? ' ' + extraClass : '');
     var input = document.createElement('input');
     input.type = 'checkbox';
     input.checked = !!checked;
+    input.setAttribute('aria-label', player + ': ' + text);
     input.addEventListener('change', function () { onChange(input.checked); });
     var span = document.createElement('span');
-    span.textContent = text;
+    var long = document.createElement('span');
+    long.className = 'lbl-long';
+    long.textContent = text;
+    var short = document.createElement('span');
+    short.className = 'lbl-short';
+    short.textContent = shortText;
+    span.appendChild(long);
+    span.appendChild(short);
     label.appendChild(input);
     label.appendChild(span);
     return label;
@@ -850,6 +925,20 @@
     save();
     showMessages(msgs);
     renderPlan(state.plan, true);
+    revealPlan();
+  }
+
+  // On narrow screens the plan is far below the button, so bring it (and any warnings) into view.
+  function narrow() {
+    return window.matchMedia && window.matchMedia('(max-width: 859px)').matches;
+  }
+  function smoothScroll() {
+    return !(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }
+  function revealPlan() {
+    if (!narrow()) return;
+    var target = $('messages').children.length ? $('messages') : $('output');
+    target.scrollIntoView({ behavior: smoothScroll() ? 'smooth' : 'auto', block: 'start' });
   }
 
   /* ---------- output rendering ---------- */
@@ -910,9 +999,9 @@
       body.innerHTML = plan.blocks.filter(function (b) { return b.half === h; }).map(function (b) {
         return '<tr>' +
           '<td class="time">' + fmtClock(b.start) + '\u2013' + fmtClock(b.end) + '</td>' +
-          '<td>' + namesHTML(b.ins, b.goalie) + '</td>' +
-          '<td class="gk-cell"><span class="bib">' + esc(b.goalie) + '</span></td>' +
-          '<td class="out-cell">' + (b.outs.length ? namesHTML(b.outs, null) : 'None') + '</td>' +
+          '<td data-label="In">' + namesHTML(b.ins, b.goalie) + '</td>' +
+          '<td class="gk-cell" data-label="Goalie"><span class="bib">' + esc(b.goalie) + '</span></td>' +
+          '<td class="out-cell" data-label="Out">' + (b.outs.length ? namesHTML(b.outs, null) : 'None') + '</td>' +
           '</tr>';
       }).join('');
     });
@@ -992,6 +1081,10 @@
     $('generateBtn').addEventListener('click', function () { generate(false); });
     $('shuffleBtn').addEventListener('click', function () { generate(true); });
     $('printBtn').addEventListener('click', function () { window.print(); });
+    $('editRoster').addEventListener('click', function () {
+      var list = $('playerList');
+      (list.children.length ? list : $('roster')).scrollIntoView({ behavior: smoothScroll() ? 'smooth' : 'auto', block: 'start' });
+    });
     $('clearData').addEventListener('click', function (e) {
       e.preventDefault();
       if (!window.confirm('Clear the saved roster, settings, and plan?')) return;
@@ -1007,6 +1100,13 @@
   }
 
   init();
+
+  // Offline support on the hosted page (service workers don't run from file://).
+  if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('sw.js').catch(function () { /* offline cache is optional */ });
+    });
+  }
 })();
 </script>
 </body>
